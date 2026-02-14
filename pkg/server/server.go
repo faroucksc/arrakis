@@ -687,10 +687,10 @@ func replaceGuestIP(cmdline string, newIP string) string {
 	return re.ReplaceAllString(cmdline, fmt.Sprintf(`guest_ip="%s"`, newIP))
 }
 
-// updateSnapshotConfig rewrites the tap device name and guest_ip in a snapshot's config.json.
+// updateSnapshotConfig rewrites the tap device name, guest_ip, and vsock CID/socket in a snapshot's config.json.
 // Uses a generic map to preserve ALL fields (cpus, memory, disks, vsock, serial, console, etc.)
 // that are not modeled by the partial VMConfig struct.
-func updateSnapshotConfig(configPath string, newTapName string, newIP *net.IPNet) error {
+func updateSnapshotConfig(configPath string, newTapName string, newIP *net.IPNet, newCID uint32, newVsockPath string) error {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("failed to read snapshot config: %w", err)
@@ -716,6 +716,14 @@ func updateSnapshotConfig(configPath string, newTapName string, newIP *net.IPNet
 		}
 	}
 
+	// Update vsock CID and socket path
+	if vsock, ok := config["vsock"].(map[string]interface{}); ok {
+		vsock["cid"] = float64(newCID)
+		if newVsockPath != "" {
+			vsock["socket"] = newVsockPath
+		}
+	}
+
 	// Write back — ALL fields preserved
 	updatedData, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
@@ -729,8 +737,8 @@ func updateSnapshotConfig(configPath string, newTapName string, newIP *net.IPNet
 }
 
 // copyAndPrepareSnapshot copies a snapshot directory to a temp location and updates
-// the config.json with the new tap device name and IP address.
-func copyAndPrepareSnapshot(origPath string, newTapName string, newIP *net.IPNet) (string, func(), error) {
+// the config.json with the new tap device name, IP address, and vsock CID/socket.
+func copyAndPrepareSnapshot(origPath string, newTapName string, newIP *net.IPNet, newCID uint32, newVsockPath string) (string, func(), error) {
 	tmpDir, err := os.MkdirTemp("", "arrakis-restore-*")
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to create temp dir: %w", err)
@@ -746,7 +754,7 @@ func copyAndPrepareSnapshot(origPath string, newTapName string, newIP *net.IPNet
 
 	// Update config.json in the copy
 	configPath := path.Join(tmpDir, "config.json")
-	if err := updateSnapshotConfig(configPath, newTapName, newIP); err != nil {
+	if err := updateSnapshotConfig(configPath, newTapName, newIP, newCID, newVsockPath); err != nil {
 		cleanupFn()
 		return "", nil, fmt.Errorf("failed to update snapshot config: %w", err)
 	}
@@ -1842,7 +1850,8 @@ func (s *Server) restoreVM(
 	vm.portForwards = portForwards
 
 	// Prepare a temp copy of the snapshot with updated config for the new resources.
-	tmpSnapshotPath, tmpCleanup, err := copyAndPrepareSnapshot(snapshotPath, tapDevice.Name, guestIP)
+	vsockPath := path.Join(vm.stateDirPath, "vsock.sock")
+	tmpSnapshotPath, tmpCleanup, err := copyAndPrepareSnapshot(snapshotPath, tapDevice.Name, guestIP, cid, vsockPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare snapshot copy: %w", err)
 	}

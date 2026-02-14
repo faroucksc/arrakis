@@ -37,7 +37,7 @@ func TestUpdateSnapshotConfig(t *testing.T) {
 		Mask: net.CIDRMask(24, 32),
 	}
 
-	if err := updateSnapshotConfig(configPath, "tap7", newIP); err != nil {
+	if err := updateSnapshotConfig(configPath, "tap7", newIP, 10, "/tmp/vsock.sock"); err != nil {
 		t.Fatalf("updateSnapshotConfig: %v", err)
 	}
 
@@ -134,7 +134,7 @@ func TestUpdateSnapshotConfigPreservesOtherFields(t *testing.T) {
 		IP:   net.ParseIP("10.0.0.50"),
 		Mask: net.CIDRMask(24, 32),
 	}
-	if err := updateSnapshotConfig(configPath, "tap3", newIP); err != nil {
+	if err := updateSnapshotConfig(configPath, "tap3", newIP, 50, "/tmp/vsock2.sock"); err != nil {
 		t.Fatalf("updateSnapshotConfig: %v", err)
 	}
 
@@ -202,11 +202,11 @@ func TestUpdateSnapshotConfigPreservesOtherFields(t *testing.T) {
 	if !ok {
 		t.Fatal("vsock field lost after updateSnapshotConfig")
 	}
-	if vsock["cid"] != float64(3) {
-		t.Errorf("vsock.cid = %v, want 3", vsock["cid"])
+	if vsock["cid"] != float64(50) {
+		t.Errorf("vsock.cid = %v, want 50", vsock["cid"])
 	}
-	if vsock["socket"] != "/tmp/vsock.sock" {
-		t.Errorf("vsock.socket = %v, want /tmp/vsock.sock", vsock["socket"])
+	if vsock["socket"] != "/tmp/vsock2.sock" {
+		t.Errorf("vsock.socket = %v, want /tmp/vsock2.sock", vsock["socket"])
 	}
 
 	// Verify net sub-fields preserved (not just tap)
@@ -264,7 +264,7 @@ func TestSnapshotCopyIsolation(t *testing.T) {
 		Mask: net.CIDRMask(24, 32),
 	}
 
-	tmpDir, cleanupFn, err := copyAndPrepareSnapshot(origDir, "tap9", newIP)
+	tmpDir, cleanupFn, err := copyAndPrepareSnapshot(origDir, "tap9", newIP, 20, "/tmp/vsock3.sock")
 	if err != nil {
 		t.Fatalf("copyAndPrepareSnapshot: %v", err)
 	}
