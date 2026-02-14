@@ -695,6 +695,10 @@ func getIPPrefix(cidr string) (string, error) {
 }
 
 func createStatefulDisk(path string, sizeInMB int32) error {
+	if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+		log.Infof("Stateful disk already exists at %s (%d bytes), skipping create", path, info.Size())
+		return nil
+	}
 	log.Infof("Creating stateful disk at %s with size %dMB", path, sizeInMB)
 	// A sparse file is created as we want to pack as many sandboxes on a server, by growing as
 	// needed.
@@ -819,13 +823,17 @@ func (s *Server) createVM(
 	}()
 
 	vmStateDir := getVmStateDirPath(s.config.StateDir, vmName)
+	_, stateDirStatErr := os.Stat(vmStateDir)
+	stateDirPreExisted := stateDirStatErr == nil
 	err := os.MkdirAll(vmStateDir, 0755)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create vm state dir: %w", err)
 	}
 	cleanup.Add(func() {
-		if err := os.RemoveAll(vmStateDir); err != nil {
-			log.WithError(err).Errorf("failed to remove vm state dir: %s", vmStateDir)
+		if !stateDirPreExisted {
+			if err := os.RemoveAll(vmStateDir); err != nil {
+				log.WithError(err).Errorf("failed to remove vm state dir: %s", vmStateDir)
+			}
 		}
 	})
 	log.Infof("CREATED: %v", vmStateDir)
@@ -931,13 +939,17 @@ func (s *Server) createVM(
 		})
 
 		statefulDiskPath = path.Join(vmStateDir, statefulDiskFilename)
+		_, diskStatErr := os.Stat(statefulDiskPath)
+		diskPreExisted := diskStatErr == nil
 		err = createStatefulDisk(statefulDiskPath, s.config.StatefulSizeInMB)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create stateful disk: %w", err)
 		}
 		cleanup.Add(func() {
-			if err := os.Remove(statefulDiskPath); err != nil {
-				log.WithError(err).Errorf("failed to remove stateful disk: %s", statefulDiskPath)
+			if !diskPreExisted {
+				if err := os.Remove(statefulDiskPath); err != nil && !os.IsNotExist(err) {
+					log.WithError(err).Errorf("failed to remove stateful disk: %s", statefulDiskPath)
+				}
 			}
 		})
 
