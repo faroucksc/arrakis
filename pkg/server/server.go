@@ -1643,8 +1643,11 @@ func (s *Server) SnapshotVM(ctx context.Context, vmName string, snapshotId strin
 		cleanup.Clean()
 	}()
 
+	// Use a longer-timeout client for snapshot operations (pause, snapshot, resume).
+	longClient := createApiClientWithTimeout(vm.apiSocketPath, restoreAPITimeout)
+
 	// Pause the VM first as this is a prerequisite for taking a snapshot as per the CHV API spec.
-	pauseReq := vm.apiClient.DefaultAPI.PauseVM(ctx)
+	pauseReq := longClient.DefaultAPI.PauseVM(ctx)
 	resp, err := pauseReq.Execute()
 	if err != nil {
 		return nil, fmt.Errorf("failed to pause VM: %w", err)
@@ -1657,7 +1660,7 @@ func (s *Server) SnapshotVM(ctx context.Context, vmName string, snapshotId strin
 
 	// Ensure we resume the VM even if snapshot fails.
 	defer func() {
-		resumeReq := vm.apiClient.DefaultAPI.ResumeVM(ctx)
+		resumeReq := longClient.DefaultAPI.ResumeVM(ctx)
 		resp, err := resumeReq.Execute()
 		if err != nil {
 			logger.Errorf("failed to resume VM: %v", err)
@@ -1703,7 +1706,7 @@ func (s *Server) SnapshotVM(ctx context.Context, vmName string, snapshotId strin
 	}
 	logger.WithField("destination", outputDir).Info("initiating VM snapshot")
 
-	snapshotReq := vm.apiClient.DefaultAPI.VmSnapshotPut(ctx)
+	snapshotReq := longClient.DefaultAPI.VmSnapshotPut(ctx)
 	snapshotReq = snapshotReq.VmSnapshotConfig(snapshotConfig)
 	resp, err = snapshotReq.Execute()
 	if err != nil {
