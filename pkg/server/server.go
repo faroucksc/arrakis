@@ -89,9 +89,9 @@ const (
 )
 
 type portForward struct {
-	hostPort    int32
-	guestPort   int32
-	description string
+	HostPort    int32  `json:"host_port"`
+	GuestPort   int32  `json:"guest_port"`
+	Description string `json:"description"`
 }
 
 func String(s string) *string {
@@ -273,9 +273,9 @@ func (s *Server) setupSinglePortForward(vmIP string, guestPort int64, descriptio
 
 	cleanup.Release()
 	return portForward{
-		hostPort:    hostPort,
-		guestPort:   int32(guestPort),
-		description: portForwardDesc,
+		HostPort:    hostPort,
+		GuestPort:   int32(guestPort),
+		Description: portForwardDesc,
 	}, nil
 }
 
@@ -601,9 +601,9 @@ func convertPortForward(pfs []portForward) []serverapi.PortForward {
 	result := make([]serverapi.PortForward, 0, len(pfs))
 	for _, pf := range pfs {
 		result = append(result, serverapi.PortForward{
-			HostPort:    serverapi.PtrString(strconv.Itoa(int(pf.hostPort))),
-			GuestPort:   serverapi.PtrString(strconv.Itoa(int(pf.guestPort))),
-			Description: serverapi.PtrString(pf.description),
+			HostPort:    serverapi.PtrString(strconv.Itoa(int(pf.HostPort))),
+			GuestPort:   serverapi.PtrString(strconv.Itoa(int(pf.GuestPort))),
+			Description: serverapi.PtrString(pf.Description),
 		})
 	}
 	return result
@@ -778,14 +778,44 @@ func NewServer(config config.ServerConfig) (*Server, error) {
 	}
 
 	log.Infof("Server config: %+v", config)
-	return &Server{
+	server := &Server{
 		vms:           make(map[string]*vm),
 		fountain:      fountain.NewFountain(config.BridgeName),
 		ipAllocator:   ipAllocator,
 		portAllocator: portAllocator,
 		cidAllocator:  cidAllocator,
 		config:        config,
-	}, nil
+	}
+
+	reg, err := server.loadRegistry()
+	if err != nil {
+		log.WithError(err).Warn("failed to load registry, starting fresh")
+	} else {
+		for name, entry := range reg.VMs {
+			if _, err := os.Stat(entry.StateDirPath); err != nil {
+				log.Warnf("registry entry %s has no state dir at %s, skipping", name, entry.StateDirPath)
+				continue
+			}
+			if err := cidAllocator.ClaimCID(entry.CID); err != nil {
+				log.WithError(err).Warnf("failed to claim CID %d for recovered VM %s, skipping", entry.CID, name)
+				continue
+			}
+			server.vms[name] = &vm{
+				name:             entry.Name,
+				stateDirPath:     entry.StateDirPath,
+				statefulDiskPath: entry.StatefulDiskPath,
+				cid:              entry.CID,
+				status:           vmStatusStopped,
+				portForwards:     entry.PortForwards,
+			}
+			log.Infof("recovered VM %s from registry (status: STOPPED)", name)
+		}
+		if err := server.saveRegistry(); err != nil {
+			log.WithError(err).Warn("failed to save cleaned registry on boot")
+		}
+	}
+
+	return server, nil
 }
 
 func (s *Server) getVMAtomic(vmName string) *vm {
@@ -1032,6 +1062,9 @@ func (s *Server) createVM(
 
 	s.lock.Lock()
 	s.vms[vmName] = vm
+	if err := s.saveRegistry(); err != nil {
+		log.WithError(err).Error("failed to save registry after creating VM")
+	}
 	s.lock.Unlock()
 
 	cleanup.Release()
@@ -1355,6 +1388,9 @@ func (s *Server) destroyVM(ctx context.Context, vmName string) error {
 
 	s.lock.Lock()
 	delete(s.vms, vmName)
+	if err := s.saveRegistry(); err != nil {
+		log.WithError(err).Error("failed to save registry after deleting VM")
+	}
 	s.lock.Unlock()
 	return nil
 }
