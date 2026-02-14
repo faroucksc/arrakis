@@ -520,20 +520,29 @@ func getVmSocketPath(vmStateDir string, vmName string) string {
 	return path.Join(vmStateDir, vmName+".sock")
 }
 
-func unixSocketClient(socketPath string) *http.Client {
+func unixSocketClient(socketPath string, timeout time.Duration) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 				return net.Dial("unix", socketPath)
 			},
 		},
-		Timeout: time.Second * 30,
+		Timeout: timeout,
 	}
 }
 
+const (
+	defaultAPITimeout = 30 * time.Second
+	restoreAPITimeout = 5 * time.Minute
+)
+
 func createApiClient(apiSocketPath string) *chvapi.APIClient {
+	return createApiClientWithTimeout(apiSocketPath, defaultAPITimeout)
+}
+
+func createApiClientWithTimeout(apiSocketPath string, timeout time.Duration) *chvapi.APIClient {
 	configuration := chvapi.NewConfiguration()
-	configuration.HTTPClient = unixSocketClient(apiSocketPath)
+	configuration.HTTPClient = unixSocketClient(apiSocketPath, timeout)
 	configuration.Servers = chvapi.ServerConfigurations{
 		{
 			URL: "http://localhost/api/v1",
@@ -667,6 +676,79 @@ func parseNetworkDataFromSnapshotConfig(configPath string) (string, *net.IPNet, 
 		return "", nil, fmt.Errorf("failed to extract guest IP from cmdline: %w", err)
 	}
 	return (*config.Net)[0].Tap, guestIP, nil
+}
+
+// replaceGuestIP replaces the guest_ip value in a kernel cmdline string.
+func replaceGuestIP(cmdline string, newIP string) string {
+	re := regexp.MustCompile(`guest_ip="[^"]*"`)
+	return re.ReplaceAllString(cmdline, fmt.Sprintf(`guest_ip="%s"`, newIP))
+}
+
+// updateSnapshotConfig rewrites the tap device name and guest_ip in a snapshot's config.json.
+// Uses a generic map to preserve ALL fields (cpus, memory, disks, vsock, serial, console, etc.)
+// that are not modeled by the partial VMConfig struct.
+func updateSnapshotConfig(configPath string, newTapName string, newIP *net.IPNet) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to read snapshot config: %w", err)
+	}
+
+	// Use generic map to preserve ALL fields
+	var config map[string]interface{}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return fmt.Errorf("failed to parse snapshot config: %w", err)
+	}
+
+	// Update net[0].tap
+	if nets, ok := config["net"].([]interface{}); ok && len(nets) > 0 {
+		if net0, ok := nets[0].(map[string]interface{}); ok {
+			net0["tap"] = newTapName
+		}
+	}
+
+	// Update guest_ip in payload.cmdline
+	if payload, ok := config["payload"].(map[string]interface{}); ok {
+		if cmdline, ok := payload["cmdline"].(string); ok {
+			payload["cmdline"] = replaceGuestIP(cmdline, newIP.String())
+		}
+	}
+
+	// Write back — ALL fields preserved
+	updatedData, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated config: %w", err)
+	}
+	tmpPath := configPath + ".tmp"
+	if err := os.WriteFile(tmpPath, updatedData, 0644); err != nil {
+		return fmt.Errorf("failed to write temp config: %w", err)
+	}
+	return os.Rename(tmpPath, configPath)
+}
+
+// copyAndPrepareSnapshot copies a snapshot directory to a temp location and updates
+// the config.json with the new tap device name and IP address.
+func copyAndPrepareSnapshot(origPath string, newTapName string, newIP *net.IPNet) (string, func(), error) {
+	tmpDir, err := os.MkdirTemp("", "arrakis-restore-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	cleanupFn := func() { os.RemoveAll(tmpDir) }
+
+	// Copy snapshot dir contents to temp
+	cmd := exec.Command("cp", "-a", origPath+"/.", tmpDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		cleanupFn()
+		return "", nil, fmt.Errorf("failed to copy snapshot dir: %w: %s", err, string(out))
+	}
+
+	// Update config.json in the copy
+	configPath := path.Join(tmpDir, "config.json")
+	if err := updateSnapshotConfig(configPath, newTapName, newIP); err != nil {
+		cleanupFn()
+		return "", nil, fmt.Errorf("failed to update snapshot config: %w", err)
+	}
+
+	return tmpDir, cleanupFn, nil
 }
 
 // getIPPrefix returns the IP prefix from the given CIDR taking into account the mask.
@@ -1625,31 +1707,41 @@ func (s *Server) restoreVM(
 		cleanup.Clean()
 	}()
 
-	oldtapdeviceName, guestIP, err := parseNetworkDataFromSnapshotConfig(snapshotPath + "/config.json")
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tap device from config: %w", err)
-	}
-	oldTapDeviceID, err := parseTapDeviceId(oldtapdeviceName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse tap device ID: %w", err)
-	}
-	logger.WithFields(log.Fields{
-		"oldTapDevice": oldtapdeviceName,
-		"guestIP":      guestIP.IP.String(),
-	}).Info("parse network data from snapshot config")
-
-	err = s.ipAllocator.ClaimIP(guestIP.IP)
-	if err != nil {
-		return nil, fmt.Errorf("failed to claim IP: %w", err)
-	}
-
-	oldTapDevice, err := s.fountain.CreateTapDevice(&oldTapDeviceID)
+	// Allocate fresh resources instead of claiming old ones from the snapshot.
+	// This avoids conflicts when restoring the same snapshot multiple times.
+	tapDevice, err := s.fountain.CreateTapDevice(nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create tap device: %w", err)
 	}
 	cleanup.Add(func() {
-		logger.Errorf("TODO: destroy tap device: %s", oldTapDevice.Name)
+		if err := s.fountain.DestroyTapDevice(tapDevice); err != nil {
+			logger.WithError(err).Errorf("failed to destroy tap device: %s", tapDevice.Name)
+		}
 	})
+
+	guestIP, err := s.ipAllocator.AllocateIP()
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate IP: %w", err)
+	}
+	cleanup.Add(func() {
+		s.ipAllocator.FreeIP(guestIP.IP)
+	})
+
+	cid, err := s.cidAllocator.AllocateCID()
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate CID: %w", err)
+	}
+	cleanup.Add(func() {
+		if err := s.cidAllocator.FreeCID(cid); err != nil {
+			logger.WithError(err).Errorf("failed to free CID %d during restore cleanup", cid)
+		}
+	})
+
+	logger.WithFields(log.Fields{
+		"tapDevice": tapDevice.Name,
+		"guestIP":   guestIP.IP.String(),
+		"cid":       cid,
+	}).Info("allocated fresh resources for restore")
 
 	vm, err := s.createVM(ctx, vmName, "", "", "", true)
 	if err != nil {
@@ -1660,8 +1752,19 @@ func (s *Server) restoreVM(
 		err := s.destroyVM(ctx, vmName)
 		logger.WithError(err).Errorf("failed to destroy VM during restore cleanup")
 	})
-	vm.tapDevice = oldTapDevice
+
+	// Wait for CHV API to be ready before restoring.
+	if err := waitForServer(ctx, vm.apiClient, 10*time.Second); err != nil {
+		return nil, fmt.Errorf("CHV API not ready after spawn: %w", err)
+	}
+
+	// Use a longer-timeout client for the restore operation.
+	restoreClient := createApiClientWithTimeout(vm.apiSocketPath, restoreAPITimeout)
+	vm.apiClient = restoreClient
+
+	vm.tapDevice = tapDevice
 	vm.ip = guestIP
+	vm.cid = cid
 
 	// Copy the stateful disk from the snapshot to the VM state directory.
 	sourcePath := path.Join(snapshotPath, statefulDiskFilename)
@@ -1676,6 +1779,7 @@ func (s *Server) restoreVM(
 		return nil, fmt.Errorf("failed to copy stateful disk from snapshot: %w", err)
 	}
 	logger.Info("successfully copied stateful disk from snapshot")
+	vm.statefulDiskPath = destPath
 
 	portForwards, err := s.setupPortForwardsToVM(guestIP.IP.String(), s.config.PortForwards)
 	if err != nil {
@@ -1688,33 +1792,23 @@ func (s *Server) restoreVM(
 	})
 	vm.portForwards = portForwards
 
-	cidFilePath := path.Join(snapshotPath, cidFilename)
-	cidBytes, err := os.ReadFile(cidFilePath)
+	// Prepare a temp copy of the snapshot with updated config for the new resources.
+	tmpSnapshotPath, tmpCleanup, err := copyAndPrepareSnapshot(snapshotPath, tapDevice.Name, guestIP)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read CID file from snapshot: %w", err)
+		return nil, fmt.Errorf("failed to prepare snapshot copy: %w", err)
 	}
-	cidStr := strings.TrimSpace(string(cidBytes))
-	cid, err := strconv.ParseUint(cidStr, 10, 32)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse CID from file: %w", err)
-	}
-	err = s.cidAllocator.ClaimCID(uint32(cid))
-	if err != nil {
-		return nil, fmt.Errorf("failed to claim CID from allocator: %w", err)
-	}
-	vm.cid = uint32(cid)
-	logger.WithField("cid", vm.cid).Info("claimed CID from snapshot")
-	cleanup.Add(func() {
-		if err := s.cidAllocator.FreeCID(vm.cid); err != nil {
-			logger.WithError(err).Errorf("failed to free CID %d during restore cleanup", vm.cid)
-		}
-	})
+	defer tmpCleanup()
 
-	err = vm.restore(ctx, snapshotPath)
+	err = vm.restore(ctx, tmpSnapshotPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to restore VM: %w", err)
 	}
 	logger.Info("restored VM")
+
+	// Verify CHV is still healthy after restore before resuming.
+	if err := waitForServer(ctx, vm.apiClient, 10*time.Second); err != nil {
+		return nil, fmt.Errorf("CHV API dead after restore: %w", err)
+	}
 
 	err = vm.resume(ctx)
 	if err != nil {
