@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -124,6 +126,7 @@ type vm struct {
 	vsockPath        string
 	cid              uint32
 	statefulDiskPath string
+	apiKey           string
 }
 
 // calculateVCPUCount returns an appropriate number of vCPUs based on host's CPU count.
@@ -213,7 +216,7 @@ func bridgeExists(bridgeName string) (bool, error) {
 	bridges := strings.Split(string(output), "\n")
 
 	for _, bridge := range bridges {
-		if strings.Contains(bridge, bridgeName+":") {
+		if strings.Contains(bridge, " "+bridgeName+":") {
 			return true, nil
 		}
 	}
@@ -889,6 +892,7 @@ func NewServer(config config.ServerConfig) (*Server, error) {
 				cid:              entry.CID,
 				status:           vmStatusStopped,
 				portForwards:     entry.PortForwards,
+				apiKey:           entry.APIKey,
 			}
 			log.Infof("recovered VM %s from registry (status: STOPPED)", name)
 		}
@@ -909,6 +913,42 @@ func (s *Server) getVMAtomic(vmName string) *vm {
 		return nil
 	}
 	return vm
+}
+
+// generateAPIKey creates a cryptographically random API key with "vk_" prefix.
+func generateAPIKey() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("failed to read random bytes: %w", err)
+	}
+	return "vk_" + hex.EncodeToString(b), nil
+}
+
+// ValidateVMKey scans all VMs for a matching apiKey.
+// Returns the VM name and true if found, empty string and false otherwise.
+// Does NOT check the admin key — the middleware handles that.
+func (s *Server) ValidateVMKey(key string) (string, bool) {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+
+	for _, vm := range s.vms {
+		if vm.apiKey == key {
+			return vm.name, true
+		}
+	}
+	return "", false
+}
+
+// GetVMAPIKey returns the API key for a given VM name.
+func (s *Server) GetVMAPIKey(vmName string) (string, error) {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+
+	vm, exists := s.vms[vmName]
+	if !exists {
+		return "", fmt.Errorf("vm %s not found", vmName)
+	}
+	return vm.apiKey, nil
 }
 
 func (s *Server) createVM(
@@ -1126,6 +1166,11 @@ func (s *Server) createVM(
 		}
 	}
 
+	apiKey, err := generateAPIKey()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate API key: %w", err)
+	}
+
 	vm := &vm{
 		name:             vmName,
 		stateDirPath:     vmStateDir,
@@ -1139,6 +1184,7 @@ func (s *Server) createVM(
 		vsockPath:        vsockPath,
 		cid:              cid,
 		statefulDiskPath: statefulDiskPath,
+		apiKey:           apiKey,
 	}
 	log.Infof("Successfully created VM: %s", vmName)
 
