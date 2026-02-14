@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,8 +36,74 @@ func sendErrorResponse(w http.ResponseWriter, statusCode int, message string) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// vmKeyValidator abstracts VM key validation for testability.
+type vmKeyValidator interface {
+	ValidateVMKey(key string) (string, bool)
+}
+
 type restServer struct {
-	vmServer *server.Server
+	vmServer     *server.Server
+	adminKey     string
+	keyValidator vmKeyValidator
+}
+
+// startVMResponseWrapper wraps the generated StartVMResponse to include the API key.
+type startVMResponseWrapper struct {
+	*serverapi.StartVMResponse
+	APIKey string `json:"api_key,omitempty"`
+}
+
+// authMiddleware validates Bearer token auth on all routes except /v1/health.
+// When adminKey is empty, auth is disabled (backward compatible).
+func (s *restServer) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Auth disabled when no admin key configured.
+		if s.adminKey == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Health endpoint is always exempt.
+		if r.URL.Path == "/"+API_VERSION+"/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Extract Bearer token.
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+			sendErrorResponse(w, http.StatusUnauthorized, "missing or invalid Authorization header")
+			return
+		}
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+
+		// Admin key grants access to all routes.
+		if token == s.adminKey {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Try VM key validation.
+		vmName, ok := s.keyValidator.ValidateVMKey(token)
+		if !ok {
+			sendErrorResponse(w, http.StatusUnauthorized, "invalid API key")
+			return
+		}
+
+		// VM key can only access routes with {name} param matching.
+		vars := mux.Vars(r)
+		routeVMName, hasName := vars["name"]
+		if !hasName {
+			sendErrorResponse(w, http.StatusForbidden, "VM key cannot access admin routes")
+			return
+		}
+		if routeVMName != vmName {
+			sendErrorResponse(w, http.StatusForbidden, "VM key not authorized for this VM")
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Health check endpoint for load balancer monitoring
@@ -91,8 +158,19 @@ func (s *restServer) startVM(w http.ResponseWriter, r *http.Request) {
 		"vmName":      vmName,
 		"startupTime": elapsedTime.String(),
 	}).Info("VM started successfully")
+
+	// Wrap response with API key.
+	apiKey, err := s.vmServer.GetVMAPIKey(vmName)
+	if err != nil {
+		logger.WithError(err).Warn("failed to get VM API key")
+	}
+	wrappedResp := startVMResponseWrapper{
+		StartVMResponse: resp,
+		APIKey:          apiKey,
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(wrappedResp)
 }
 
 func (s *restServer) destroyVM(w http.ResponseWriter, r *http.Request) {
@@ -430,9 +508,14 @@ func main() {
 		log.Fatalf("failed to create VM server: %v", err)
 	}
 
+	if serverConfig.AdminAPIKey == "" {
+		log.Warn("admin_api_key not set — authentication is DISABLED")
+	}
+
 	// Create REST server
-	s := &restServer{vmServer: vmServer}
+	s := &restServer{vmServer: vmServer, adminKey: serverConfig.AdminAPIKey, keyValidator: vmServer}
 	r := mux.NewRouter()
+	r.Use(s.authMiddleware)
 
 	// Register routes
 	r.HandleFunc("/"+API_VERSION+"/vms", s.startVM).Methods("POST")

@@ -31,6 +31,7 @@ type ServerConfig struct {
 	InitramfsPath      string              `mapstructure:"initramfs"`
 	StatefulSizeInMB   int32               `mapstructure:"stateful_size_in_mb"`
 	GuestMemPercentage int32               `mapstructure:"guest_mem_percentage"`
+	AdminAPIKey        string              `mapstructure:"admin_api_key"`
 }
 
 func (c ServerConfig) String() string {
@@ -47,6 +48,7 @@ PortForwards: %+v
 InitramfsPath: %s
 StatefulSizeInMB: %d
 GuestMemPercentage: %d
+AdminAPIKey: %s
 }`,
 		c.Host,
 		c.Port,
@@ -60,6 +62,7 @@ GuestMemPercentage: %d
 		c.InitramfsPath,
 		c.StatefulSizeInMB,
 		c.GuestMemPercentage,
+		c.AdminAPIKey,
 	)
 }
 

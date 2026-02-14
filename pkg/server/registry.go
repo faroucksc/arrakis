@@ -16,6 +16,7 @@ type registryEntry struct {
 	CID              uint32        `json:"cid"`
 	IP               string        `json:"ip"`
 	PortForwards     []portForward `json:"port_forwards"`
+	APIKey           string        `json:"api_key"`
 }
 
 type registry struct {
@@ -37,6 +38,7 @@ func (s *Server) saveRegistry() error {
 			CID:              vm.cid,
 			IP:               ipStr,
 			PortForwards:     vm.portForwards,
+			APIKey:           vm.apiKey,
 		}
 	}
 	data, err := json.MarshalIndent(reg, "", "  ")
